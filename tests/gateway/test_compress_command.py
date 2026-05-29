@@ -90,6 +90,80 @@ async def test_compress_command_reports_noop_without_success_banner():
 
 
 @pytest.mark.asyncio
+async def test_compress_command_preserves_tool_and_codex_messages_for_compression():
+    history = [
+        {"role": "user", "content": "please inspect the repo"},
+        {
+            "role": "assistant",
+            "content": "",
+            "tool_calls": [
+                {
+                    "id": "call_1",
+                    "type": "function",
+                    "function": {"name": "read_file", "arguments": "{}"},
+                }
+            ],
+            "codex_reasoning_items": [
+                {"type": "reasoning", "encrypted_content": "enc_live"}
+            ],
+            "codex_compaction_items": [
+                {"type": "compaction", "encrypted_content": "opaque_compaction_blob"}
+            ],
+        },
+        {
+            "role": "tool",
+            "tool_call_id": "call_1",
+            "content": "large tool output that must be visible to compression",
+        },
+        {
+            "role": "assistant",
+            "content": "done",
+            "codex_message_items": [
+                {
+                    "type": "message",
+                    "id": "msg_1",
+                    "role": "assistant",
+                    "status": "completed",
+                    "phase": "final",
+                    "content": [{"type": "output_text", "text": "done"}],
+                }
+            ],
+        },
+        {"role": "user", "content": "now compress"},
+    ]
+    compressed = [history[0], {"role": "assistant", "content": "summary"}, history[-1]]
+    runner = _make_runner(history)
+    agent_instance = MagicMock()
+    agent_instance.shutdown_memory_provider = MagicMock()
+    agent_instance.close = MagicMock()
+    agent_instance._cached_system_prompt = ""
+    agent_instance.tools = None
+    agent_instance.context_compressor.has_content_to_compress.return_value = True
+    agent_instance.session_id = "sess-1"
+    agent_instance._compress_context.return_value = (compressed, "")
+
+    def _estimate(messages, **_kwargs):
+        if messages == history:
+            return 500
+        if messages == compressed:
+            return 100
+        raise AssertionError(f"unexpected transcript: {messages!r}")
+
+    with (
+        patch("gateway.run._resolve_runtime_agent_kwargs", return_value={"api_key": "test-key"}),
+        patch("gateway.run._resolve_gateway_model", return_value="test-model"),
+        patch("run_agent.AIAgent", return_value=agent_instance),
+        patch("agent.model_metadata.estimate_request_tokens_rough", side_effect=_estimate),
+    ):
+        result = await runner._handle_compress_command(_make_event())
+
+    assert "Compressed: 5 → 3 messages" in result
+    agent_instance.context_compressor.has_content_to_compress.assert_called_once_with(history)
+    agent_instance._compress_context.assert_called_once()
+    assert agent_instance._compress_context.call_args.args[0] == history
+
+
+@pytest.mark.asyncio
 async def test_compress_command_explains_when_token_estimate_rises():
     history = _make_history()
     compressed = [
