@@ -21,6 +21,18 @@ sys.modules.setdefault("fal_client", types.SimpleNamespace())
 from run_agent import AIAgent
 
 
+@pytest.fixture(autouse=True)
+def _clear_aux_unhealthy_cache():
+    """Provider parity tests should not inherit aux health state from prior modules."""
+    import agent.auxiliary_client as _aux_mod
+
+    _aux_mod._aux_unhealthy_until.clear()
+    _aux_mod._aux_unhealthy_logged_at.clear()
+    yield
+    _aux_mod._aux_unhealthy_until.clear()
+    _aux_mod._aux_unhealthy_logged_at.clear()
+
+
 # ── Helpers ──────────────────────────────────────────────────────────────────
 
 def _tool_defs(*names):
@@ -789,6 +801,28 @@ class TestNormalizeCodexResponse:
         msg, reason = _normalize_codex_response(response)
         assert msg.codex_message_items is None
 
+    def test_compaction_item_captured(self, monkeypatch):
+        """Codex remote compaction returns an opaque compaction item to replay."""
+        agent = self._make_codex_agent(monkeypatch)
+        response = SimpleNamespace(
+            output=[
+                SimpleNamespace(
+                    type="compaction",
+                    encrypted_content="opaque_compaction_blob",
+                    id="cmp_123",
+                    status="completed",
+                ),
+            ],
+            status="completed",
+        )
+
+        msg, reason = _normalize_codex_response(response)
+
+        assert reason == "stop"
+        assert msg.codex_compaction_items == [
+            {"type": "compaction", "encrypted_content": "opaque_compaction_blob", "id": "cmp_123"}
+        ]
+
 
 class TestChatMessagesToResponsesInputMessageItems:
     """Verify codex_message_items are replayed verbatim instead of reconstructed."""
@@ -1120,6 +1154,45 @@ class TestCodexReasoningPreflight:
         reasoning_items = [i for i in items if isinstance(i, dict) and i.get("type") == "reasoning"]
         assert len(reasoning_items) == 1
         assert reasoning_items[0]["encrypted_content"] == "enc123"
+
+    def test_compaction_item_passes_through_preflight_without_id(self, monkeypatch):
+        """Opaque compaction blobs are self-contained; don't replay stale item IDs."""
+        agent = _make_agent(monkeypatch, "openai-codex", api_mode="codex_responses",
+                            base_url="https://chatgpt.com/backend-api/codex")
+        raw_input = [
+            {"type": "compaction", "encrypted_content": "opaque_compaction_blob", "id": "cmp_1"},
+            {"role": "user", "content": "continue"},
+        ]
+
+        normalized = _preflight_codex_input_items(raw_input)
+
+        compaction_items = [i for i in normalized if i.get("type") == "compaction"]
+        assert compaction_items == [
+            {"type": "compaction", "encrypted_content": "opaque_compaction_blob"}
+        ]
+
+    def test_compaction_items_replayed_from_history(self, monkeypatch):
+        """Stored Codex compaction anchors must be replayed as Responses input."""
+        agent = _make_agent(monkeypatch, "openai-codex", api_mode="codex_responses",
+                            base_url="https://chatgpt.com/backend-api/codex")
+        messages = [
+            {"role": "user", "content": "old request"},
+            {
+                "role": "assistant",
+                "content": "",
+                "codex_compaction_items": [
+                    {"type": "compaction", "encrypted_content": "opaque_compaction_blob", "id": "cmp_1"},
+                ],
+            },
+            {"role": "user", "content": "continue"},
+        ]
+
+        items = _chat_messages_to_responses_input(messages)
+
+        compaction_items = [i for i in items if isinstance(i, dict) and i.get("type") == "compaction"]
+        assert compaction_items == [
+            {"type": "compaction", "encrypted_content": "opaque_compaction_blob"}
+        ]
 
 
 # ── Reasoning effort consistency tests ───────────────────────────────────────

@@ -476,7 +476,8 @@ def _is_fresh_gateway_interruption(
 #
 # ``reasoning`` and ``reasoning_details`` were the original three preserved
 # by PR #2974 (schema v6).  ``reasoning_content``, ``codex_reasoning_items``,
-# ``codex_message_items``, and ``finish_reason`` were added to the DB later
+# ``codex_message_items``, ``codex_compaction_items``, and ``finish_reason``
+# were added to the DB later
 # but the gateway's replay whitelist was never expanded to match — so any
 # pure-text assistant turn (no ``tool_calls``) silently dropped them on
 # replay, regressing the CLI-vs-gateway behavioural parity.
@@ -496,6 +497,8 @@ def _is_fresh_gateway_interruption(
 #   * ``codex_message_items``: exact assistant message items with ``phase``.
 #     OpenAI docs: "preserve and resend phase on all assistant messages —
 #     dropping it can degrade performance."  Required for prefix cache hits.
+#   * ``codex_compaction_items``: Codex-native opaque compaction anchors
+#     returned as ``type: compaction`` Responses items.
 #   * ``finish_reason``: informational; cheap to keep so transcripts replay
 #     identically across CLI and gateway.
 _ASSISTANT_REPLAY_FIELDS: tuple[str, ...] = (
@@ -504,6 +507,7 @@ _ASSISTANT_REPLAY_FIELDS: tuple[str, ...] = (
     "reasoning_details",
     "codex_reasoning_items",
     "codex_message_items",
+    "codex_compaction_items",
     "finish_reason",
 )
 
@@ -12486,11 +12490,48 @@ class GatewayRunner:
             if not runtime_kwargs.get("api_key"):
                 return t("gateway.compress.no_provider")
 
-            msgs = [
-                {"role": m.get("role"), "content": m.get("content")}
-                for m in history
-                if m.get("role") in {"user", "assistant"} and m.get("content")
-            ]
+            def _message_for_compression(m: dict) -> dict | None:
+                role = m.get("role")
+                if role not in {"system", "user", "assistant", "tool"}:
+                    return None
+                keep_keys = {
+                    "role",
+                    "content",
+                    "tool_calls",
+                    "tool_call_id",
+                    "name",
+                    "function_call",
+                    "codex_reasoning_items",
+                    "codex_message_items",
+                    "codex_compaction_items",
+                    "_anthropic_content_blocks",
+                }
+                msg = {k: m[k] for k in keep_keys if k in m}
+                if role in {"system", "user"}:
+                    return msg if msg.get("content") else None
+                if role == "assistant":
+                    has_payload = any(
+                        msg.get(k)
+                        for k in (
+                            "content",
+                            "tool_calls",
+                            "function_call",
+                            "codex_reasoning_items",
+                            "codex_message_items",
+                            "codex_compaction_items",
+                        )
+                    )
+                    return msg if has_payload else None
+                # Tool results may legitimately have empty string content, but
+                # their call_id is still required to keep provider history
+                # well-formed through compression.
+                return msg if ("content" in msg or "tool_call_id" in msg) else None
+
+            msgs = []
+            for m in history:
+                msg = _message_for_compression(m)
+                if msg is not None:
+                    msgs.append(msg)
 
             # Boundary-aware split: only the head is summarized; the most
             # recent `keep_last` exchanges are preserved verbatim. The
@@ -13348,6 +13389,7 @@ class GatewayRunner:
                     reasoning_details=msg.get("reasoning_details"),
                     codex_reasoning_items=msg.get("codex_reasoning_items"),
                     codex_message_items=msg.get("codex_message_items"),
+                    codex_compaction_items=msg.get("codex_compaction_items"),
                 )
             except Exception:
                 pass  # Best-effort copy

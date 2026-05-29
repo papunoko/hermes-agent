@@ -1078,7 +1078,7 @@ DEFAULT_CONFIG = {
             "model": "",
             "base_url": "",
             "api_key": "",
-            "timeout": 120,        # seconds — compression summarises large contexts; increase for local models
+            "timeout": 1200,       # seconds (20min) — compression summarises large Codex/tool-heavy contexts
             "extra_body": {},
         },
         # Note: session_search no longer uses an auxiliary LLM (PR #27590 —

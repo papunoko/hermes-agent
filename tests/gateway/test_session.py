@@ -1171,14 +1171,26 @@ class TestRewriteTranscriptPreservesReasoning:
             reasoning_content="provider scratchpad",
             reasoning_details=[{"type": "summary", "text": "step by step"}],
             codex_reasoning_items=[{"id": "r1", "type": "reasoning"}],
+            codex_message_items=[{"id": "m1", "type": "message", "phase": "commentary"}],
+            codex_compaction_items=[{
+                "id": "cmp1",
+                "type": "compaction",
+                "encrypted_content": "opaque_compaction_blob",
+            }],
         )
 
-        # Verify all three were stored
+        # Verify provider-native replay fields were stored
         before = db.get_messages_as_conversation(session_id)
         assert before[0].get("reasoning") == "I need to think step by step."
         assert before[0].get("reasoning_content") == "provider scratchpad"
         assert before[0].get("reasoning_details") == [{"type": "summary", "text": "step by step"}]
         assert before[0].get("codex_reasoning_items") == [{"id": "r1", "type": "reasoning"}]
+        assert before[0].get("codex_message_items") == [{"id": "m1", "type": "message", "phase": "commentary"}]
+        assert before[0].get("codex_compaction_items") == [{
+            "id": "cmp1",
+            "type": "compaction",
+            "encrypted_content": "opaque_compaction_blob",
+        }]
 
         # Now simulate /retry: build the SessionStore and call rewrite_transcript
         config = GatewayConfig()
@@ -1196,6 +1208,12 @@ class TestRewriteTranscriptPreservesReasoning:
         assert after[0].get("reasoning_content") == "provider scratchpad"
         assert after[0].get("reasoning_details") == [{"type": "summary", "text": "step by step"}]
         assert after[0].get("codex_reasoning_items") == [{"id": "r1", "type": "reasoning"}]
+        assert after[0].get("codex_message_items") == [{"id": "m1", "type": "message", "phase": "commentary"}]
+        assert after[0].get("codex_compaction_items") == [{
+            "id": "cmp1",
+            "type": "compaction",
+            "encrypted_content": "opaque_compaction_blob",
+        }]
 
     def test_db_rewrite_is_atomic_on_insert_failure(self, tmp_path, monkeypatch):
         from hermes_state import SessionDB

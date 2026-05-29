@@ -1468,6 +1468,69 @@ The user has requested that this compaction PRIORITISE preserving all informatio
             )
             return None
 
+    def _generate_codex_native_compaction(
+        self,
+        turns_to_summarize: List[Dict[str, Any]],
+    ) -> List[Dict[str, Any]]:
+        """Ask Codex Responses for an opaque native compaction anchor.
+
+        This is a best-effort provider-specific fast path.  The returned
+        ``type=compaction`` item is replayable by Codex and acts as the primary
+        compressed substrate; the plaintext handoff summary remains a human- and
+        fallback-readable reference.  Any failure here must not suppress the
+        plaintext summary path.
+        """
+        if not self._is_codex_responses_mode() or not turns_to_summarize:
+            return []
+        try:
+            from agent.codex_responses_adapter import (
+                _chat_messages_to_responses_input,
+                _normalize_codex_compaction_item,
+            )
+
+            input_items = _chat_messages_to_responses_input(turns_to_summarize)
+            if not input_items:
+                return []
+            call_kwargs = {
+                "task": "compression",
+                "main_runtime": {
+                    "model": self.model,
+                    "provider": self.provider,
+                    "base_url": self.base_url,
+                    "api_key": self.api_key,
+                    "api_mode": self.api_mode,
+                },
+                # Codex auxiliary adapter reads the direct Responses input from
+                # extra_body; this empty chat message only satisfies the generic
+                # call_llm interface used by non-Responses clients.
+                "messages": [{"role": "user", "content": ""}],
+                "max_tokens": 1,
+                "extra_body": {
+                    "codex_responses_input_items": input_items,
+                    "codex_compaction_trigger": True,
+                },
+            }
+            if self.summary_model:
+                call_kwargs["model"] = self.summary_model
+            response = call_llm(**call_kwargs)
+            message = response.choices[0].message
+            raw_items = getattr(message, "codex_compaction_items", None) or []
+            normalized: List[Dict[str, Any]] = []
+            if isinstance(raw_items, list):
+                for item in raw_items:
+                    compacted = _normalize_codex_compaction_item(item, keep_id=True)
+                    if compacted is not None:
+                        normalized.append(compacted)
+            if len(normalized) > 1:
+                logger.debug(
+                    "Codex native compaction returned %d anchors; keeping the first",
+                    len(normalized),
+                )
+            return normalized[:1]
+        except Exception as exc:
+            logger.debug("Codex native compaction unavailable; falling back to plaintext summary: %s", exc)
+            return []
+
     @staticmethod
     def _strip_summary_prefix(summary: str) -> str:
         """Return summary body without the current or legacy handoff prefix."""
@@ -1487,6 +1550,30 @@ The user has requested that this compaction PRIORITISE preserving all informatio
     def _is_context_summary_content(content: Any) -> bool:
         text = _content_text_for_contains(content).lstrip()
         return text.startswith(SUMMARY_PREFIX) or text.startswith(LEGACY_SUMMARY_PREFIX)
+
+    def _is_codex_responses_mode(self) -> bool:
+        """True when this compressor is serving the Codex Responses transport."""
+        provider = (self.provider or "").strip().lower()
+        api_mode = (self.api_mode or "").strip().lower()
+        return api_mode == "codex_responses" or provider == "openai-codex"
+
+    @staticmethod
+    def _has_codex_responses_replay_items(msg: Dict[str, Any]) -> bool:
+        """Return True when a chat assistant message carries Responses items.
+
+        Such messages are not just text: the Codex adapter replays their
+        ``codex_reasoning_items`` / ``codex_message_items`` directly as
+        Responses input items. Mutating their ``content`` to hold a synthetic
+        compression summary is therefore unsafe because the adapter may ignore
+        that mutated content in favour of the exact stored message item.
+        """
+        if not isinstance(msg, dict):
+            return False
+        for key in ("codex_compaction_items", "codex_reasoning_items", "codex_message_items"):
+            value = msg.get(key)
+            if isinstance(value, list) and value:
+                return True
+        return False
 
     @classmethod
     def _find_latest_context_summary(
@@ -1854,6 +1941,15 @@ The user has requested that this compaction PRIORITISE preserving all informatio
             if summary_body and not self._previous_summary:
                 self._previous_summary = summary_body
             turns_to_summarize = messages[max(compress_start, summary_idx + 1):compress_end]
+        # On re-compression, the previous handoff summary can live inside the
+        # protected head (for example after a resumed/manual-compressed
+        # session).  That summary is being superseded by the freshly generated
+        # one below, so do not also preserve it as live head context.  Keeping
+        # both makes /compress appear ineffective and can even grow the request
+        # by stacking summary-on-summary.
+        protected_previous_summary_idx = (
+            summary_idx if summary_idx is not None and summary_idx < compress_start else None
+        )
 
         if not self.quiet_mode:
             logger.info(
@@ -1877,7 +1973,11 @@ The user has requested that this compaction PRIORITISE preserving all informatio
                 tail_msgs,
             )
 
-        # Phase 3: Generate structured summary
+        # Phase 3: Generate provider-native compaction anchor (Codex only) and
+        # the plaintext structured summary.  The opaque anchor is the primary
+        # replay substrate when available; the summary remains the readable
+        # fallback/reference handoff.
+        codex_compaction_items = self._generate_codex_native_compaction(turns_to_summarize)
         summary = self._generate_summary(turns_to_summarize, focus_topic=focus_topic)
 
         # If summary generation failed, behavior splits on
@@ -1909,6 +2009,8 @@ The user has requested that this compaction PRIORITISE preserving all informatio
         # Phase 4: Assemble compressed message list
         compressed = []
         for i in range(compress_start):
+            if i == protected_previous_summary_idx:
+                continue
             msg = messages[i].copy()
             if i == 0 and msg.get("role") == "system":
                 existing = msg.get("content")
@@ -1935,7 +2037,7 @@ The user has requested that this compaction PRIORITISE preserving all informatio
             )
 
         _merge_summary_into_tail = False
-        last_head_role = messages[compress_start - 1].get("role", "user") if compress_start > 0 else "user"
+        last_head_role = compressed[-1].get("role", "user") if compressed else "user"
         first_tail_role = messages[compress_end].get("role", "user") if compress_end < n_messages else "user"
         # Pick a role that avoids consecutive same-role with both neighbors.
         # Priority: avoid colliding with head (already committed), then tail.
@@ -1956,6 +2058,23 @@ The user has requested that this compaction PRIORITISE preserving all informatio
                 # of inserting a standalone message that breaks alternation.
                 _merge_summary_into_tail = True
 
+        if (
+            _merge_summary_into_tail
+            and self._is_codex_responses_mode()
+            and compress_end < n_messages
+            and self._has_codex_responses_replay_items(messages[compress_end])
+        ):
+            # Codex Responses assistant turns can carry exact replay items.
+            # If we prepend the synthetic handoff to such a tail message, the
+            # adapter replays codex_message_items and drops the mutated content,
+            # so the summary disappears from the actual request.  For this
+            # provider-specific path, prefer a standalone summary even if it
+            # means tolerating a same-role boundary in the internal chat list;
+            # the Responses input builder accepts explicit item lists and keeps
+            # the protected Codex tail metadata intact.
+            _merge_summary_into_tail = False
+            summary_role = "user" if first_tail_role == "assistant" else "assistant"
+
         # When the summary lands as a standalone role="user" message,
         # weak models read the verbatim "## Active Task" quote of a past
         # user request as fresh input (#11475, #14521). Append the explicit
@@ -1967,6 +2086,13 @@ The user has requested that this compaction PRIORITISE preserving all informatio
                 + "\n\n--- END OF CONTEXT SUMMARY — "
                 "respond to the message below, not the summary above ---"
             )
+
+        if codex_compaction_items:
+            compressed.append({
+                "role": "assistant",
+                "content": "",
+                "codex_compaction_items": codex_compaction_items,
+            })
 
         if not _merge_summary_into_tail:
             compressed.append({"role": summary_role, "content": summary})

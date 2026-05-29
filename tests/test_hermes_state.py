@@ -643,6 +643,24 @@ class TestMessageStorage:
         assert conv[0]["codex_reasoning_items"] == codex_items
         assert conv[0]["codex_reasoning_items"][0]["encrypted_content"] == "enc_blob_123"
 
+    def test_codex_compaction_items_persisted_and_restored(self, db):
+        """Codex compaction anchors must round-trip through JSON serialization."""
+        db.create_session(session_id="s1", source="cli")
+        compaction_items = [
+            {"type": "compaction", "id": "cmp_abc", "encrypted_content": "opaque_compaction_blob"},
+        ]
+        db.append_message(
+            "s1",
+            role="assistant",
+            content="",
+            codex_compaction_items=compaction_items,
+        )
+
+        conv = db.get_messages_as_conversation("s1")
+        assert len(conv) == 1
+        assert conv[0]["codex_compaction_items"] == compaction_items
+        assert conv[0]["codex_compaction_items"][0]["encrypted_content"] == "opaque_compaction_blob"
+
 
 # =========================================================================
 # FTS5 search

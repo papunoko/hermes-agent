@@ -188,6 +188,235 @@ class TestCompress:
         assert msgs[-2]["content"] in result[-2]["content"]
 
 
+class TestRecompression:
+    def test_recompression_replaces_protected_previous_summary(self):
+        with patch("agent.context_compressor.get_model_context_length", return_value=100000):
+            c = ContextCompressor(
+                model="test/model",
+                threshold_percent=0.85,
+                protect_first_n=3,
+                protect_last_n=3,
+                quiet_mode=True,
+            )
+
+        previous_summary = f"{SUMMARY_PREFIX}\nold compacted state that should be superseded"
+        messages = [
+            {"role": "user", "content": "initial seed"},
+            {"role": "user", "content": previous_summary},
+            {"role": "assistant", "content": "protected early assistant context"},
+            {"role": "user", "content": "older user work to fold in"},
+            {"role": "assistant", "content": "older assistant work to fold in"},
+            {"role": "user", "content": "recent user request stays live"},
+            {"role": "assistant", "content": "recent assistant answer stays live"},
+            {"role": "user", "content": "latest user turn stays live"},
+        ]
+
+        with patch(
+            "agent.context_compressor.call_llm",
+            return_value=self._summary_response("updated compacted state"),
+        ):
+            result = c.compress(messages, current_tokens=90_000)
+
+        summary_messages = [
+            msg for msg in result
+            if SUMMARY_PREFIX in str(msg.get("content", ""))
+        ]
+        assert len(summary_messages) == 1
+        assert "updated compacted state" in str(summary_messages[0]["content"])
+        assert all(
+            "old compacted state that should be superseded" not in str(msg.get("content", ""))
+            for msg in result
+        )
+        assert len(result) < len(messages)
+
+    def _summary_response(self, text):
+        mock_response = MagicMock()
+        mock_response.choices = [MagicMock()]
+        mock_response.choices[0].message.content = text
+        return mock_response
+
+
+class TestCodexResponsesCompress:
+    def _compressor(self):
+        with patch("agent.context_compressor.get_model_context_length", return_value=100000):
+            return ContextCompressor(
+                model="gpt-5.4",
+                provider="openai-codex",
+                api_mode="codex_responses",
+                threshold_percent=0.85,
+                protect_first_n=1,
+                protect_last_n=3,
+                quiet_mode=True,
+            )
+
+    def _summary_response(self, text="Codex-specific compacted state"):
+        mock_response = MagicMock()
+        mock_response.choices = [MagicMock()]
+        mock_response.choices[0].message.content = text
+        return mock_response
+
+    def _compaction_response(self, encrypted="opaque_compaction_blob"):
+        mock_response = MagicMock()
+        mock_response.choices = [MagicMock()]
+        mock_response.choices[0].message.content = None
+        mock_response.choices[0].message.codex_compaction_items = [
+            {"type": "compaction", "encrypted_content": encrypted, "id": "cmp_test"}
+        ]
+        return mock_response
+
+    def _codex_assistant(self, text: str, suffix: str) -> dict:
+        return {
+            "role": "assistant",
+            "content": text,
+            "codex_reasoning_items": [
+                {
+                    "type": "reasoning",
+                    "id": f"rs_{suffix}",
+                    "encrypted_content": f"enc_{suffix}",
+                    "summary": [],
+                }
+            ],
+            "codex_message_items": [
+                {
+                    "type": "message",
+                    "id": f"msg_{suffix}",
+                    "role": "assistant",
+                    "status": "completed",
+                    "phase": "commentary",
+                    "content": [{"type": "output_text", "text": text}],
+                }
+            ],
+        }
+
+    def _messages_with_item_backed_tail(self):
+        # With protect_first_n=1 and the default 3-message hard tail floor,
+        # index 4 becomes the first protected tail message. Because the head
+        # role is user and the tail role is assistant, the generic compressor
+        # would merge the summary into that assistant message to avoid a
+        # role-collision. That is unsafe for Codex Responses because
+        # codex_message_items replay ignores the mutated chat content.
+        return [
+            {"role": "user", "content": "Head context that remains live"},
+            self._codex_assistant("Old assistant item to summarize", "old"),
+            {"role": "user", "content": "Old user turn to summarize"},
+            {"role": "assistant", "content": "Old plain assistant turn to summarize"},
+            self._codex_assistant("Recent Codex assistant item to replay", "tail"),
+            {"role": "user", "content": "Latest user request stays live"},
+            {"role": "assistant", "content": "Latest assistant response stays live"},
+        ]
+
+    def test_codex_summary_stays_standalone_before_item_backed_tail(self):
+        c = self._compressor()
+        messages = self._messages_with_item_backed_tail()
+
+        with patch("agent.context_compressor.call_llm", return_value=self._summary_response()):
+            result = c.compress(messages, current_tokens=90_000)
+
+        summary_messages = [
+            msg for msg in result
+            if msg.get("role") in {"user", "assistant"}
+            and SUMMARY_PREFIX in str(msg.get("content", ""))
+        ]
+        assert len(summary_messages) == 1
+        summary_msg = summary_messages[0]
+        assert summary_msg["role"] == "user"
+        assert "codex_reasoning_items" not in summary_msg
+        assert "codex_message_items" not in summary_msg
+
+        tail_msg = next(msg for msg in result if msg.get("content") == "Recent Codex assistant item to replay")
+        assert tail_msg["codex_reasoning_items"] == messages[4]["codex_reasoning_items"]
+        assert tail_msg["codex_message_items"] == messages[4]["codex_message_items"]
+
+    def test_codex_compressed_history_replays_summary_and_tail_items(self):
+        from agent.codex_responses_adapter import (
+            _chat_messages_to_responses_input,
+            _preflight_codex_input_items,
+        )
+
+        c = self._compressor()
+        messages = self._messages_with_item_backed_tail()
+
+        with patch("agent.context_compressor.call_llm", return_value=self._summary_response()):
+            result = c.compress(messages, current_tokens=90_000)
+
+        items = _preflight_codex_input_items(_chat_messages_to_responses_input(result))
+
+        assert any(
+            item.get("role") == "user"
+            and SUMMARY_PREFIX in str(item.get("content", ""))
+            for item in items
+        )
+        assert any(
+            item.get("type") == "reasoning"
+            and item.get("encrypted_content") == "enc_tail"
+            and "id" not in item
+            for item in items
+        )
+        assert any(
+            item.get("type") == "message"
+            and item.get("id") == "msg_tail"
+            and item.get("phase") == "commentary"
+            and item.get("status") == "completed"
+            for item in items
+        )
+
+    def test_codex_native_compaction_anchor_is_inserted_before_plaintext_summary(self):
+        c = self._compressor()
+        messages = self._messages_with_item_backed_tail()
+
+        with patch(
+            "agent.context_compressor.call_llm",
+            side_effect=[
+                self._compaction_response("opaque_primary_anchor"),
+                self._summary_response("plaintext reference summary"),
+            ],
+        ) as mock_call:
+            result = c.compress(messages, current_tokens=90_000)
+
+        assert mock_call.call_count == 2
+        compaction_call = mock_call.call_args_list[0].kwargs
+        assert compaction_call["extra_body"]["codex_compaction_trigger"] is True
+        assert compaction_call["extra_body"]["codex_responses_input_items"]
+        assert compaction_call["messages"][0]["content"] == ""
+
+        anchor_idx = next(
+            i for i, msg in enumerate(result)
+            if msg.get("codex_compaction_items")
+        )
+        summary_idx = next(
+            i for i, msg in enumerate(result)
+            if SUMMARY_PREFIX in str(msg.get("content", ""))
+        )
+        assert anchor_idx < summary_idx
+        assert result[anchor_idx]["role"] == "assistant"
+        assert result[anchor_idx]["content"] == ""
+        assert result[anchor_idx]["codex_compaction_items"] == [
+            {"type": "compaction", "encrypted_content": "opaque_primary_anchor", "id": "cmp_test"}
+        ]
+        assert "plaintext reference summary" in str(result[summary_idx]["content"])
+
+    def test_codex_native_compaction_failure_falls_back_to_plaintext_summary(self):
+        c = self._compressor()
+        messages = self._messages_with_item_backed_tail()
+
+        with patch(
+            "agent.context_compressor.call_llm",
+            side_effect=[
+                RuntimeError("compaction trigger unsupported"),
+                self._summary_response("plaintext fallback summary"),
+            ],
+        ) as mock_call:
+            result = c.compress(messages, current_tokens=90_000)
+
+        assert mock_call.call_count == 2
+        assert not any(msg.get("codex_compaction_items") for msg in result)
+        assert any(
+            SUMMARY_PREFIX in str(msg.get("content", ""))
+            and "plaintext fallback summary" in str(msg.get("content", ""))
+            for msg in result
+        )
+
+
 class TestGenerateSummaryNoneContent:
     """Regression: content=None (from tool-call-only assistant messages) must not crash."""
 

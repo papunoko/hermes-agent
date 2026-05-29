@@ -2490,6 +2490,79 @@ class TestCodexAdapterReasoningTranslation:
         assert "reasoning" not in captured
         assert "include" not in captured
 
+    def test_compaction_trigger_extra_body_appends_responses_item(self):
+        adapter, captured = self._build_adapter()
+        adapter.create(
+            messages=[{"role": "user", "content": "compact this history"}],
+            extra_body={"codex_compaction_trigger": True},
+        )
+
+        assert captured["input"][:-1] == [
+            {"role": "user", "content": "compact this history"}
+        ]
+        assert captured["input"][-1] == {"type": "compaction_trigger"}
+
+    def test_compaction_trigger_can_use_direct_responses_input_items(self):
+        adapter, captured = self._build_adapter()
+        direct_items = [
+            {"role": "user", "content": "old user turn"},
+            {"type": "message", "role": "assistant", "content": [
+                {"type": "output_text", "text": "old assistant turn"},
+            ]},
+        ]
+
+        adapter.create(
+            messages=[{"role": "user", "content": "ignored when direct input is supplied"}],
+            extra_body={
+                "codex_responses_input_items": direct_items,
+                "codex_compaction_trigger": True,
+            },
+        )
+
+        assert captured["input"][:-1] == direct_items
+        assert captured["input"][-1] == {"type": "compaction_trigger"}
+
+    def test_compaction_output_exposed_on_chat_message(self):
+        from agent.auxiliary_client import _CodexCompletionsAdapter
+
+        compaction_item = SimpleNamespace(
+            type="compaction",
+            id="cmp_123",
+            encrypted_content="opaque_compaction_blob",
+        )
+
+        events = [
+            SimpleNamespace(type="response.created"),
+            SimpleNamespace(type="response.output_item.done", item=compaction_item),
+            SimpleNamespace(
+                type="response.completed",
+                response=SimpleNamespace(status="completed", id="resp_test", usage=None),
+            ),
+        ]
+
+        class _FakeCreateStream:
+            def __iter__(self): return iter(events)
+            def close(self): pass
+
+        real_client = MagicMock()
+        real_client.responses.create = lambda **_kwargs: _FakeCreateStream()
+        adapter = _CodexCompletionsAdapter(real_client, "gpt-5.3-codex")
+
+        response = adapter.create(
+            messages=[{"role": "user", "content": "compact this"}],
+            extra_body={"codex_compaction_trigger": True},
+        )
+
+        msg = response.choices[0].message
+        assert msg.content is None
+        assert msg.codex_compaction_items == [
+            {
+                "type": "compaction",
+                "encrypted_content": "opaque_compaction_blob",
+                "id": "cmp_123",
+            }
+        ]
+
     def test_extra_body_without_reasoning_key_is_noop(self):
         adapter, captured = self._build_adapter()
         adapter.create(
@@ -3109,6 +3182,12 @@ def _clean_env(monkeypatch):
         "NVIDIA_API_KEY", "NVIDIA_BASE_URL",
     ):
         monkeypatch.delenv(key, raising=False)
+    import agent.auxiliary_client as _aux_mod
+    _aux_mod._aux_unhealthy_until.clear()
+    _aux_mod._aux_unhealthy_logged_at.clear()
+    yield
+    _aux_mod._aux_unhealthy_until.clear()
+    _aux_mod._aux_unhealthy_logged_at.clear()
 
 
 class TestNvidiaBillingHeaders:

@@ -937,6 +937,12 @@ def build_assistant_message(agent, assistant_message, finish_reason: str) -> dic
     if codex_message_items:
         msg["codex_message_items"] = codex_message_items
 
+    # Codex remote compaction: preserve opaque compaction anchors returned by
+    # the Responses API so compressed history can be replayed natively.
+    codex_compaction_items = getattr(assistant_message, "codex_compaction_items", None)
+    if codex_compaction_items:
+        msg["codex_compaction_items"] = codex_compaction_items
+
     if assistant_tool_calls:
         tool_calls = []
         for tool_call in assistant_tool_calls:

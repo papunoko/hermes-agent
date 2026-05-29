@@ -6,11 +6,13 @@ pure-text assistant turn (no ``tool_calls``) is replayed, the simple-text
 branch in ``run_sync`` used to whitelist only three reasoning fields:
 ``reasoning``, ``reasoning_details``, ``codex_reasoning_items``.
 
-That whitelist predated three fields the DB now persists:
-``reasoning_content``, ``codex_message_items``, and ``finish_reason``.  The
-unrecovered drop of ``codex_message_items`` in particular kills prefix-cache
-hits for OpenAI Codex Responses API users — OpenAI's docs require the
-``phase`` field be replayed on every assistant message.
+That whitelist predated fields the DB now persists:
+``reasoning_content``, ``codex_message_items``, ``codex_compaction_items``,
+and ``finish_reason``.  The unrecovered drop of ``codex_message_items`` in
+particular kills prefix-cache hits for OpenAI Codex Responses API users —
+OpenAI's docs require the ``phase`` field be replayed on every assistant
+message.  ``codex_compaction_items`` carries Codex-native opaque compaction
+anchors.
 
 These tests pin the expanded whitelist so it doesn't regress.
 """
@@ -127,6 +129,22 @@ class TestBuildReplayEntry:
         entry = _build_replay_entry("assistant", "Done", msg)
         assert entry["codex_message_items"] == items
 
+    def test_assistant_preserves_codex_compaction_items(self):
+        items = [
+            {
+                "type": "compaction",
+                "id": "cmp_123",
+                "encrypted_content": "opaque_compaction_blob",
+            }
+        ]
+        msg = {
+            "role": "assistant",
+            "content": "",
+            "codex_compaction_items": items,
+        }
+        entry = _build_replay_entry("assistant", "", msg)
+        assert entry["codex_compaction_items"] == items
+
     def test_assistant_preserves_finish_reason(self):
         """finish_reason was silently dropped before this fix.
 
@@ -151,6 +169,7 @@ class TestBuildReplayEntry:
             "reasoning_details": [],
             "codex_reasoning_items": [],
             "codex_message_items": [],
+            "codex_compaction_items": [],
             "finish_reason": "",
         }
         entry = _build_replay_entry("assistant", "answer", msg)
@@ -184,7 +203,7 @@ class TestBuildReplayEntry:
         entry = _build_replay_entry("assistant", "answer", msg)
         assert "reasoning_content" not in entry
 
-    def test_assistant_preserves_all_six_fields_together(self):
+    def test_assistant_preserves_all_replay_fields_together(self):
         details = [{"type": "reasoning.summary", "summary": "s"}]
         codex_items = [{"type": "reasoning", "encrypted_content": "b"}]
         msg_items = [
@@ -195,6 +214,7 @@ class TestBuildReplayEntry:
                 "content": [{"type": "output_text", "text": "x"}],
             }
         ]
+        compaction_items = [{"type": "compaction", "encrypted_content": "opaque"}]
         msg = {
             "role": "assistant",
             "content": "answer",
@@ -203,6 +223,7 @@ class TestBuildReplayEntry:
             "reasoning_details": details,
             "codex_reasoning_items": codex_items,
             "codex_message_items": msg_items,
+            "codex_compaction_items": compaction_items,
             "finish_reason": "stop",
         }
         entry = _build_replay_entry("assistant", "answer", msg)
@@ -211,6 +232,7 @@ class TestBuildReplayEntry:
         assert entry["reasoning_details"] == details
         assert entry["codex_reasoning_items"] == codex_items
         assert entry["codex_message_items"] == msg_items
+        assert entry["codex_compaction_items"] == compaction_items
         assert entry["finish_reason"] == "stop"
 
     def test_assistant_does_not_invent_keys(self):
@@ -223,6 +245,7 @@ class TestBuildReplayEntry:
             "reasoning_details",
             "codex_reasoning_items",
             "codex_message_items",
+            "codex_compaction_items",
             "finish_reason",
         ):
             assert absent not in entry
@@ -235,6 +258,7 @@ class TestBuildReplayEntry:
             "reasoning_details",
             "codex_reasoning_items",
             "codex_message_items",
+            "codex_compaction_items",
             "finish_reason",
         )
 

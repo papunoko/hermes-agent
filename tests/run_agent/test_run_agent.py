@@ -1873,6 +1873,17 @@ class TestBuildAssistantMessage:
         assert "reasoning_details" in result
         assert result["reasoning_details"][0]["text"] == "step1"
 
+    def test_codex_compaction_items_preserved(self, agent):
+        compaction_items = [
+            {"type": "compaction", "encrypted_content": "opaque_compaction_blob", "id": "cmp_1"}
+        ]
+        msg = _mock_assistant_msg(content="")
+        msg.codex_compaction_items = compaction_items
+
+        result = agent._build_assistant_message(msg, "stop")
+
+        assert result["codex_compaction_items"] == compaction_items
+
     def test_empty_content(self, agent):
         msg = _mock_assistant_msg(content=None)
         result = agent._build_assistant_message(msg, "stop")

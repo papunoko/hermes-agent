@@ -669,6 +669,21 @@ class _CodexCompletionsAdapter:
         # same behavior as the main agent's Codex transport.
         extra_body = kwargs.get("extra_body") or {}
         if isinstance(extra_body, dict):
+            direct_input = extra_body.get("codex_responses_input_items")
+            if isinstance(direct_input, list):
+                resp_kwargs["input"] = [
+                    dict(item) if isinstance(item, dict) else item
+                    for item in direct_input
+                ] or [{"role": "user", "content": ""}]
+
+            if extra_body.get("codex_compaction_trigger") is True:
+                input_items = resp_kwargs.get("input")
+                if not isinstance(input_items, list):
+                    input_items = [{"role": "user", "content": str(input_items or "")}]
+                if not input_items or input_items[-1] != {"type": "compaction_trigger"}:
+                    input_items = list(input_items) + [{"type": "compaction_trigger"}]
+                resp_kwargs["input"] = input_items
+
             reasoning_cfg = extra_body.get("reasoning")
             if isinstance(reasoning_cfg, dict):
                 if reasoning_cfg.get("enabled") is False:
@@ -827,9 +842,11 @@ class _CodexCompletionsAdapter:
             if final is None:
                 raise RuntimeError("Codex auxiliary Responses stream did not return a final response")
 
-            # Extract text and tool calls from the Responses output.
-            # Items may be SimpleNamespace (raw-event path) or dicts
-            # (some legacy fallback paths), so handle both shapes.
+            # Extract text, tool calls, and opaque Codex-native compaction anchors
+            # from the Responses output.  Items may be SimpleNamespace
+            # (raw-event path) or dicts (some legacy fallback paths), so
+            # handle both shapes.
+            codex_compaction_items: List[Dict[str, Any]] = []
             def _item_get(obj: Any, key: str, default: Any = None) -> Any:
                 val = getattr(obj, key, None)
                 if val is None and isinstance(obj, dict):
@@ -852,6 +869,16 @@ class _CodexCompletionsAdapter:
                             arguments=_item_get(item, "arguments", "{}"),
                         ),
                     ))
+                elif item_type == "compaction":
+                    try:
+                        from agent.codex_responses_adapter import _normalize_codex_compaction_item
+
+                        compacted = _normalize_codex_compaction_item(item, keep_id=True)
+                    except Exception:
+                        logger.debug("Codex auxiliary: failed to normalize compaction item", exc_info=True)
+                        compacted = None
+                    if compacted is not None:
+                        codex_compaction_items.append(compacted)
 
             resp_usage = getattr(final, "usage", None)
             if resp_usage:
@@ -879,6 +906,7 @@ class _CodexCompletionsAdapter:
             role="assistant",
             content=content,
             tool_calls=tool_calls_raw or None,
+            codex_compaction_items=codex_compaction_items or None,
         )
         choice = SimpleNamespace(
             index=0,

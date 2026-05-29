@@ -48,6 +48,11 @@ def test_session_search_no_longer_appears_in_auxiliary_model_config():
     assert "session_search" not in {key for key, _name, _desc in _AUX_TASKS}
 
 
+def test_compression_default_timeout_is_twenty_minutes():
+    """Compression can summarize very large Codex histories, so its default timeout is generous."""
+    assert DEFAULT_CONFIG["auxiliary"]["compression"]["timeout"] == 1200
+
+
 def test_aux_tasks_keys_all_exist_in_default_config():
     """Every task the menu offers must be defined in DEFAULT_CONFIG."""
     aux_keys = {k for k, _name, _desc in _AUX_TASKS}
@@ -222,7 +227,7 @@ def test_reset_aux_to_auto_clears_routing_preserves_timeouts(tmp_path, monkeypat
     # User-tuned timeout survives reset
     assert cfg["auxiliary"]["vision"]["timeout"] == 300
     # Default compression timeout preserved
-    assert cfg["auxiliary"]["compression"]["timeout"] == 120
+    assert cfg["auxiliary"]["compression"]["timeout"] == 1200
 
 
 def test_reset_aux_to_auto_idempotent(tmp_path, monkeypatch):

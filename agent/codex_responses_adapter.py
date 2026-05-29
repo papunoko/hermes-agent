@@ -276,6 +276,33 @@ def _normalize_responses_message_status(value: Any, *, default: str = "completed
     return default
 
 
+def _normalize_codex_compaction_item(
+    item: Any,
+    *,
+    keep_id: bool = False,
+) -> Optional[Dict[str, Any]]:
+    """Return a sanitized Codex compaction item, or None when unusable.
+
+    Codex CLI remote compaction emits opaque ``type=compaction`` items whose
+    ``encrypted_content`` is the provider-native compressed substrate.  The
+    blob is self-contained for replay; local item IDs are retained only at the
+    storage boundary and stripped before sending to avoid server-side lookup
+    failures when ``store=False``.
+    """
+    if isinstance(item, dict):
+        encrypted = item.get("encrypted_content")
+        item_id = item.get("id")
+    else:
+        encrypted = getattr(item, "encrypted_content", None)
+        item_id = getattr(item, "id", None)
+    if not isinstance(encrypted, str) or not encrypted:
+        return None
+    normalized: Dict[str, Any] = {"type": "compaction", "encrypted_content": encrypted}
+    if keep_id and isinstance(item_id, str) and item_id:
+        normalized["id"] = item_id
+    return normalized
+
+
 def _chat_messages_to_responses_input(
     messages: List[Dict[str, Any]],
     *,
@@ -345,6 +372,23 @@ def _chat_messages_to_responses_input(
                 # This applies to every Responses transport including
                 # xAI — see _chat_messages_to_responses_input docstring
                 # for the May 2026 reversal of the earlier xAI gate.
+                codex_compaction = (
+                    msg.get("codex_compaction_items")
+                    if replay_encrypted_reasoning
+                    else None
+                )
+                if isinstance(codex_compaction, list):
+                    for ci in codex_compaction:
+                        replay_item = _normalize_codex_compaction_item(ci, keep_id=False)
+                        if replay_item is None:
+                            continue
+                        item_id = ci.get("id") if isinstance(ci, dict) else None
+                        if isinstance(item_id, str) and item_id in seen_item_ids:
+                            continue
+                        items.append(replay_item)
+                        if isinstance(item_id, str) and item_id:
+                            seen_item_ids.add(item_id)
+
                 codex_reasoning = (
                     msg.get("codex_reasoning_items")
                     if replay_encrypted_reasoning
@@ -634,6 +678,17 @@ def _preflight_codex_input_items(raw_items: Any) -> List[Dict[str, Any]]:
                     "output": output,
                 }
             )
+            continue
+
+        if item_type == "compaction":
+            compaction_item = _normalize_codex_compaction_item(item, keep_id=False)
+            if compaction_item is not None:
+                item_id = item.get("id")
+                if isinstance(item_id, str) and item_id:
+                    if item_id in seen_ids:
+                        continue
+                    seen_ids.add(item_id)
+                normalized.append(compaction_item)
             continue
 
         if item_type == "reasoning":
@@ -1072,6 +1127,7 @@ def _normalize_codex_response(
     reasoning_parts: List[str] = []
     reasoning_items_raw: List[Dict[str, Any]] = []
     message_items_raw: List[Dict[str, Any]] = []
+    compaction_items_raw: List[Dict[str, Any]] = []
     tool_calls: List[Any] = []
     has_incomplete_items = response_status in {"queued", "in_progress", "incomplete"}
     saw_commentary_phase = False
@@ -1149,6 +1205,10 @@ def _normalize_codex_response(
                             raw_summary.append({"type": "summary_text", "text": text})
                     raw_item["summary"] = raw_summary
                 reasoning_items_raw.append(raw_item)
+        elif item_type == "compaction":
+            compaction_item = _normalize_codex_compaction_item(item, keep_id=True)
+            if compaction_item is not None:
+                compaction_items_raw.append(compaction_item)
         elif item_type == "function_call":
             if item_status in {"queued", "in_progress", "incomplete"}:
                 continue
@@ -1239,6 +1299,7 @@ def _normalize_codex_response(
         reasoning_details=None,
         codex_reasoning_items=reasoning_items_raw or None,
         codex_message_items=message_items_raw or None,
+        codex_compaction_items=compaction_items_raw or None,
     )
 
     if tool_calls:

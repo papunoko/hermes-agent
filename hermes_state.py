@@ -272,6 +272,7 @@ CREATE TABLE IF NOT EXISTS messages (
     reasoning_details TEXT,
     codex_reasoning_items TEXT,
     codex_message_items TEXT,
+    codex_compaction_items TEXT,
     platform_message_id TEXT,
     observed INTEGER DEFAULT 0
 );
@@ -1660,6 +1661,7 @@ class SessionDB:
         reasoning_details: Any = None,
         codex_reasoning_items: Any = None,
         codex_message_items: Any = None,
+        codex_compaction_items: Any = None,
         platform_message_id: str = None,
         observed: bool = False,
     ) -> int:
@@ -1688,6 +1690,10 @@ class SessionDB:
             json.dumps(codex_message_items)
             if codex_message_items else None
         )
+        codex_compaction_items_json = (
+            json.dumps(codex_compaction_items)
+            if codex_compaction_items else None
+        )
         tool_calls_json = json.dumps(tool_calls) if tool_calls else None
         # Multimodal content (list of parts) must be JSON-encoded: sqlite3
         # cannot bind list/dict parameters directly.
@@ -1703,8 +1709,8 @@ class SessionDB:
                 """INSERT INTO messages (session_id, role, content, tool_call_id,
                    tool_calls, tool_name, timestamp, token_count, finish_reason,
                    reasoning, reasoning_content, reasoning_details, codex_reasoning_items,
-                   codex_message_items, platform_message_id, observed)
-                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                   codex_message_items, codex_compaction_items, platform_message_id, observed)
+                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
                 (
                     session_id,
                     role,
@@ -1720,6 +1726,7 @@ class SessionDB:
                     reasoning_details_json,
                     codex_items_json,
                     codex_message_items_json,
+                    codex_compaction_items_json,
                     platform_message_id,
                     1 if observed else 0,
                 ),
@@ -1772,6 +1779,9 @@ class SessionDB:
                 codex_message_items = (
                     msg.get("codex_message_items") if role == "assistant" else None
                 )
+                codex_compaction_items = (
+                    msg.get("codex_compaction_items") if role == "assistant" else None
+                )
 
                 reasoning_details_json = (
                     json.dumps(reasoning_details) if reasoning_details else None
@@ -1781,6 +1791,9 @@ class SessionDB:
                 )
                 codex_message_items_json = (
                     json.dumps(codex_message_items) if codex_message_items else None
+                )
+                codex_compaction_items_json = (
+                    json.dumps(codex_compaction_items) if codex_compaction_items else None
                 )
                 tool_calls_json = json.dumps(tool_calls) if tool_calls else None
                 # Accept either `platform_message_id` (new explicit name) or
@@ -1793,8 +1806,8 @@ class SessionDB:
                     """INSERT INTO messages (session_id, role, content, tool_call_id,
                        tool_calls, tool_name, timestamp, token_count, finish_reason,
                        reasoning, reasoning_content, reasoning_details, codex_reasoning_items,
-                       codex_message_items, platform_message_id, observed)
-                       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                       codex_message_items, codex_compaction_items, platform_message_id, observed)
+                       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
                     (
                         session_id,
                         role,
@@ -1810,6 +1823,7 @@ class SessionDB:
                         reasoning_details_json,
                         codex_items_json,
                         codex_message_items_json,
+                        codex_compaction_items_json,
                         platform_msg_id,
                         1 if msg.get("observed") else 0,
                     ),
@@ -2129,7 +2143,8 @@ class SessionDB:
             rows = self._conn.execute(
                 "SELECT role, content, tool_call_id, tool_calls, tool_name, "
                 "finish_reason, reasoning, reasoning_content, reasoning_details, "
-                "codex_reasoning_items, codex_message_items, platform_message_id, observed "
+                "codex_reasoning_items, codex_message_items, codex_compaction_items, "
+                "platform_message_id, observed "
                 f"FROM messages WHERE session_id IN ({placeholders}) ORDER BY id",
                 tuple(session_ids),
             ).fetchall()
@@ -2187,6 +2202,12 @@ class SessionDB:
                     except (json.JSONDecodeError, TypeError):
                         logger.warning("Failed to deserialize codex_message_items, falling back to None")
                         msg["codex_message_items"] = None
+                if row["codex_compaction_items"]:
+                    try:
+                        msg["codex_compaction_items"] = json.loads(row["codex_compaction_items"])
+                    except (json.JSONDecodeError, TypeError):
+                        logger.warning("Failed to deserialize codex_compaction_items, falling back to None")
+                        msg["codex_compaction_items"] = None
             if include_ancestors and self._is_duplicate_replayed_user_message(messages, msg):
                 continue
             messages.append(msg)
@@ -3546,4 +3567,3 @@ class SessionDB:
                 (error[:500], session_id),
             )
         self._execute_write(_do)
-
