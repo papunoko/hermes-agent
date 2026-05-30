@@ -6,7 +6,7 @@ Telegram topics act as independent Hermes session lanes.
 
 from datetime import datetime
 from types import SimpleNamespace
-from unittest.mock import AsyncMock, MagicMock
+from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
@@ -504,21 +504,22 @@ async def test_topic_binding_follows_compression_tip_on_read(tmp_path, monkeypat
             origin=topic_source,
         )
 
-    runner.session_store.switch_session = MagicMock(side_effect=fake_switch)
+    runner.session_store.switch_session.side_effect = fake_switch
     runner._run_agent = AsyncMock(
         return_value={
             "success": True,
-            "final_response": "ok",
+            "final_response": "child response",
             "session_id": "child-session",
             "messages": [],
         }
     )
-
     monkeypatch.setattr(
         gateway_run, "_resolve_runtime_agent_kwargs", lambda: {"api_key": "***"}
     )
 
-    await runner._handle_message(_make_event("follow up after compression", thread_id="17585"))
+    await runner._handle_message(
+        _make_event("follow up after compression", thread_id="17585")
+    )
 
     # The route was advanced to the compression tip, not the stale parent.
     assert switched_to.get("id") == "child-session"
@@ -529,6 +530,116 @@ async def test_topic_binding_follows_compression_tip_on_read(tmp_path, monkeypat
     )
     assert refreshed is not None
     assert refreshed["session_id"] == "child-session"
+
+
+@pytest.mark.asyncio
+async def test_compress_command_follows_topic_binding_compression_tip(tmp_path):
+    """/compress must read the bound compression child, not the static lane id."""
+    session_db = SessionDB(db_path=tmp_path / "state.db")
+    session_db.enable_telegram_topic_mode(chat_id="208214988", user_id="208214988")
+    session_db.create_session(
+        session_id="parent-session", source="telegram", user_id="208214988",
+    )
+    session_db.end_session("parent-session", end_reason="compression")
+    session_db.create_session(
+        session_id="child-session",
+        source="telegram",
+        user_id="208214988",
+        parent_session_id="parent-session",
+    )
+    topic_source = _make_source(thread_id="17585")
+    topic_key = build_session_key(topic_source)
+    session_db.bind_telegram_topic(
+        chat_id="208214988",
+        thread_id="17585",
+        user_id="208214988",
+        session_key=topic_key,
+        session_id="parent-session",
+    )
+
+    history = [
+        {"role": "user", "content": "one"},
+        {"role": "assistant", "content": "two"},
+        {"role": "user", "content": "three"},
+        {"role": "assistant", "content": "four"},
+    ]
+    compressed = [history[0], {"role": "assistant", "content": "summary"}, history[-1]]
+    runner = _make_runner(session_db=session_db)
+    loaded_session_ids = []
+
+    def load_transcript(session_id):
+        loaded_session_ids.append(session_id)
+        return list(history) if session_id == "child-session" else []
+
+    runner.session_store.load_transcript.side_effect = load_transcript
+    agent_instance = MagicMock()
+    agent_instance.shutdown_memory_provider = MagicMock()
+    agent_instance.close = MagicMock()
+    agent_instance._cached_system_prompt = ""
+    agent_instance.tools = None
+    agent_instance.context_compressor.has_content_to_compress.return_value = True
+    agent_instance.session_id = "child-session"
+    agent_instance._compress_context.return_value = (compressed, "")
+
+    def estimate(messages, **_kwargs):
+        if messages == history:
+            return 100
+        if messages == compressed:
+            return 40
+        raise AssertionError(f"unexpected transcript: {messages!r}")
+
+    with (
+        patch("gateway.run._resolve_runtime_agent_kwargs", return_value={"api_key": "***"}),
+        patch("gateway.run._resolve_gateway_model", return_value="test-model"),
+        patch("run_agent.AIAgent", return_value=agent_instance),
+        patch("agent.model_metadata.estimate_request_tokens_rough", side_effect=estimate),
+    ):
+        result = await runner._handle_compress_command(
+            _make_event("/compress", thread_id="17585")
+        )
+
+    assert "Compressed:" in result
+    assert loaded_session_ids == ["child-session"]
+    runner.session_store.switch_session.assert_called_once_with(
+        topic_key, "child-session"
+    )
+    refreshed = session_db.get_telegram_topic_binding(
+        chat_id="208214988", thread_id="17585",
+    )
+    assert refreshed is not None
+    assert refreshed["session_id"] == "child-session"
+
+
+@pytest.mark.asyncio
+async def test_compress_command_uses_restored_topic_binding(tmp_path):
+    """/compress should honor /topic <session> bindings before loading history."""
+    session_db = SessionDB(db_path=tmp_path / "state.db")
+    session_db.enable_telegram_topic_mode(chat_id="208214988", user_id="208214988")
+    session_db.create_session(
+        session_id="restored-session", source="telegram", user_id="208214988",
+    )
+    topic_source = _make_source(thread_id="17585")
+    topic_key = build_session_key(topic_source)
+    session_db.bind_telegram_topic(
+        chat_id="208214988",
+        thread_id="17585",
+        user_id="208214988",
+        session_key=topic_key,
+        session_id="restored-session",
+    )
+
+    runner = _make_runner(session_db=session_db)
+    runner.session_store.load_transcript.side_effect = lambda session_id: []
+
+    result = await runner._handle_compress_command(
+        _make_event("/compress", thread_id="17585")
+    )
+
+    assert "not enough" in result.lower()
+    runner.session_store.load_transcript.assert_called_once_with("restored-session")
+    runner.session_store.switch_session.assert_called_once_with(
+        topic_key, "restored-session"
+    )
 
 
 @pytest.mark.asyncio

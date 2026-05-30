@@ -2360,6 +2360,84 @@ class GatewayRunner:
                 "telegram topic binding refresh failed (%s)", reason, exc_info=True,
             )
 
+    def _resolve_telegram_topic_session_entry(
+        self,
+        source: SessionSource,
+        session_entry,
+        *,
+        reason: str,
+        record_if_missing: bool = True,
+    ):
+        """Resolve a Telegram topic lane through its durable binding.
+
+        Topic-mode Telegram DMs have two identities:
+        - session_key, derived from (chat_id, thread_id), used by the live gateway;
+        - session_id, stored in the binding table so the topic can be restored
+          after /resume, restart, or compression-driven session splits.
+
+        Always route through the binding before reading the transcript. If the
+        binding still points at a pre-compression parent, walk to the compression
+        tip and rewrite the binding to the live continuation.
+        """
+        if not self._is_telegram_topic_lane(source):
+            return session_entry
+
+        session_db = getattr(self, "_session_db", None)
+        try:
+            binding = session_db.get_telegram_topic_binding(
+                chat_id=str(source.chat_id),
+                thread_id=str(source.thread_id),
+            ) if session_db else None
+        except Exception:
+            logger.debug("Failed to read Telegram topic binding", exc_info=True)
+            binding = None
+
+        if binding:
+            original_bound_session_id = str(binding.get("session_id") or "")
+            bound_session_id = original_bound_session_id
+            if bound_session_id and session_db is not None:
+                try:
+                    canonical_session_id = session_db.get_compression_tip(
+                        bound_session_id,
+                    )
+                except Exception:
+                    logger.debug(
+                        "compression-tip lookup failed for %s",
+                        bound_session_id,
+                        exc_info=True,
+                    )
+                    canonical_session_id = bound_session_id
+                if canonical_session_id:
+                    bound_session_id = str(canonical_session_id)
+
+            if bound_session_id and bound_session_id != session_entry.session_id:
+                switched = self.session_store.switch_session(
+                    session_entry.session_key,
+                    bound_session_id,
+                )
+                if switched is not None:
+                    session_entry = switched
+
+            if (
+                bound_session_id
+                and bound_session_id == session_entry.session_id
+                and bound_session_id != original_bound_session_id
+            ):
+                self._sync_telegram_topic_binding(
+                    source,
+                    session_entry,
+                    reason=f"{reason}-compression-tip",
+                )
+            return session_entry
+
+        if record_if_missing:
+            self._sync_telegram_topic_binding(
+                source,
+                session_entry,
+                reason=f"{reason}-new-binding",
+            )
+        return session_entry
+
     def _recover_telegram_topic_thread_id(
         self,
         source: SessionSource,
@@ -8374,61 +8452,11 @@ class GatewayRunner:
         session_key = session_entry.session_key
         self._cache_session_source(session_key, source)
         if self._is_telegram_topic_lane(source):
-            try:
-                binding = self._session_db.get_telegram_topic_binding(
-                    chat_id=str(source.chat_id),
-                    thread_id=str(source.thread_id),
-                ) if self._session_db else None
-            except Exception:
-                logger.debug("Failed to read Telegram topic binding", exc_info=True)
-                binding = None
-            if binding:
-                bound_session_id = str(binding.get("session_id") or "")
-                # Heal bindings that point at a pre-compression parent: walk
-                # the compression-continuation chain forward to its tip so the
-                # next message resumes the compressed child instead of
-                # reloading the oversized parent transcript (#20470/#29712/
-                # #33414). Returns the input unchanged when the session isn't
-                # a compression parent, so this is cheap and safe.
-                if bound_session_id and self._session_db is not None:
-                    try:
-                        canonical_session_id = self._session_db.get_compression_tip(
-                            bound_session_id,
-                        )
-                    except Exception:
-                        logger.debug(
-                            "compression-tip lookup failed for %s",
-                            bound_session_id, exc_info=True,
-                        )
-                        canonical_session_id = bound_session_id
-                    if (
-                        canonical_session_id
-                        and canonical_session_id != bound_session_id
-                    ):
-                        bound_session_id = canonical_session_id
-                if bound_session_id and bound_session_id != session_entry.session_id:
-                    # Route the override through SessionStore so the session_key
-                    # → session_id mapping is persisted to disk and the previous
-                    # lane session is ended cleanly. Mutating session_entry in
-                    # place here created a split-brain state where the JSON
-                    # index pointed at one id but code downstream used another.
-                    switched = self.session_store.switch_session(session_key, bound_session_id)
-                    if switched is not None:
-                        session_entry = switched
-                # If the stored binding pointed at a parent, rewrite it to the
-                # canonical descendant now that we've followed the chain.
-                if (
-                    bound_session_id
-                    and bound_session_id != str(binding.get("session_id") or "")
-                ):
-                    self._sync_telegram_topic_binding(
-                        source, session_entry, reason="compression-tip-walk",
-                    )
-            else:
-                try:
-                    self._record_telegram_topic_binding(source, session_entry)
-                except Exception:
-                    logger.debug("Failed to record Telegram topic binding", exc_info=True)
+            session_entry = self._resolve_telegram_topic_session_entry(
+                source,
+                session_entry,
+                reason="inbound",
+            )
         if getattr(session_entry, "was_auto_reset", False):
             # Treat auto-reset as a full conversation boundary — drop every
             # session-scoped transient state so the fresh session does not
@@ -12462,6 +12490,11 @@ class GatewayRunner:
         """
         source = event.source
         session_entry = self.session_store.get_or_create_session(source)
+        session_entry = self._resolve_telegram_topic_session_entry(
+            source,
+            session_entry,
+            reason="compress-command",
+        )
         history = self.session_store.load_transcript(session_entry.session_id)
 
         if not history or len(history) < 4:
@@ -12482,7 +12515,7 @@ class GatewayRunner:
             from agent.manual_compression_feedback import summarize_manual_compression
             from agent.model_metadata import estimate_request_tokens_rough
 
-            session_key = self._session_key_for_source(source)
+            session_key = session_entry.session_key or self._session_key_for_source(source)
             model, runtime_kwargs = self._resolve_session_agent_runtime(
                 source=source,
                 session_key=session_key,
@@ -12592,7 +12625,9 @@ class GatewayRunner:
                     session_entry.session_id = new_session_id
                     self.session_store._save()
                     self._sync_telegram_topic_binding(
-                        source, session_entry, reason="compress-command",
+                        source,
+                        session_entry,
+                        reason="compress-command",
                     )
 
                 self.session_store.rewrite_transcript(new_session_id, compressed)
