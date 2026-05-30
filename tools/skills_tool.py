@@ -961,9 +961,24 @@ def skill_view(
                     _record(found_skill_md.parent, found_skill_md)
 
             # Strategy 3: legacy flat <name>.md files anywhere under the dir.
+            #
+            # Do not treat linked support assets as standalone skills. Skills
+            # commonly ship files like ``templates/notion.md`` or
+            # ``references/styles/sketch.md``; those basenames may legitimately
+            # match real skill names and must not make bare skill lookup
+            # ambiguous. Direct top-level legacy files are still handled by
+            # Strategy 1 above.
+            support_dirs = {"references", "templates", "scripts", "assets"}
             for found_md in search_dir.rglob(f"{name}.md"):
-                if found_md.name != "SKILL.md":
-                    _record(None, found_md)
+                if found_md.name == "SKILL.md":
+                    continue
+                try:
+                    rel_parts = found_md.relative_to(search_dir).parts[:-1]
+                except ValueError:
+                    rel_parts = found_md.parts[:-1]
+                if any(part in support_dirs for part in rel_parts):
+                    continue
+                _record(None, found_md)
 
         if len(candidates) > 1:
             paths = [str(smd) for _, smd in candidates]

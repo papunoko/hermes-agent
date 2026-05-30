@@ -1267,3 +1267,32 @@ class TestSkillViewCollisionDetection:
         result = json.loads(raw)
         assert result["success"] is True
         assert "LOCAL BODY" in result["content"]
+
+    def test_support_markdown_with_skill_name_does_not_collide(self, tmp_path):
+        """A linked reference/template named like a real skill is not a skill.
+
+        Skills can ship support files such as templates/notion.md or
+        references/styles/sketch.md. Bare skill lookup must ignore those files;
+        otherwise unrelated support assets make real skills ambiguous.
+        """
+        local_dir = tmp_path / "local"
+        external_dir = tmp_path / "external"
+        local_dir.mkdir()
+        external_dir.mkdir()
+
+        _make_skill(local_dir, "notion", category="productivity", body="NOTION SKILL")
+        template_dir = local_dir / "creative" / "popular-web-designs" / "templates"
+        template_dir.mkdir(parents=True)
+        (template_dir / "notion.md").write_text("# Notion visual style template\n")
+
+        refs_dir = local_dir / "creative" / "illustrator" / "references" / "styles"
+        refs_dir.mkdir(parents=True)
+        (refs_dir / "notion.md").write_text("# Notion-inspired style notes\n")
+
+        p1, p2 = self._patch_dirs(local_dir, [external_dir])
+        with p1, p2:
+            raw = skill_view("notion")
+
+        result = json.loads(raw)
+        assert result["success"] is True
+        assert "NOTION SKILL" in result["content"]
