@@ -24,9 +24,9 @@ Architecture:
 2. Aggregator model synthesizes responses into a high-quality output
 3. Multiple layers can be used for iterative refinement (future enhancement)
 
-Models Used (via OpenRouter):
-- Reference Models: claude-opus-4.6, gemini-3-pro-preview, gpt-5.4-pro, deepseek-v3.2
-- Aggregator Model: claude-opus-4.6 (highest capability for synthesis)
+Models Used:
+- Reference Models: configurable via HERMES_MOA_REFERENCE_MODELS
+- Aggregator Model: configurable via HERMES_MOA_AGGREGATOR_MODEL
 
 Configuration:
     To customize the MoA setup, modify the configuration constants at the top of this file:
@@ -59,48 +59,279 @@ import sys
 logger = logging.getLogger(__name__)
 
 # Configuration for MoA processing
-# Reference models - these generate diverse initial responses in parallel.
-# Keep this list aligned with current top-tier OpenRouter frontier options.
-REFERENCE_MODELS = [
-    "anthropic/claude-opus-4.6",
-    "google/gemini-2.5-pro",
-    "openai/gpt-5.4-pro",
-    "deepseek/deepseek-v3.2",
-]
+def _env_list(name: str, default: List[str]) -> List[str]:
+    raw = os.getenv(name, "").strip()
+    if not raw:
+        return default
+    return [item.strip() for item in raw.split(",") if item.strip()] or default
 
-# Aggregator model - synthesizes reference responses into final output.
-# Prefer the strongest synthesis model in the current OpenRouter lineup.
-AGGREGATOR_MODEL = "anthropic/claude-opus-4.6"
 
-# Temperature settings optimized for MoA performance
-REFERENCE_TEMPERATURE = 0.6  # Balanced creativity for diverse perspectives
-AGGREGATOR_TEMPERATURE = 0.4  # Focused synthesis for consistency
+def _env_text(name: str, default: str) -> str:
+    value = os.getenv(name, "").strip()
+    return value or default
 
-# Failure handling configuration
-MIN_SUCCESSFUL_REFERENCES = 1  # Minimum successful reference models needed to proceed
 
-# System prompt for the aggregator model (from the research paper)
-AGGREGATOR_SYSTEM_PROMPT = """You have been provided with a set of responses from various open-source models to the latest user query. Your task is to synthesize these responses into a single, high-quality response. It is crucial to critically evaluate the information provided in these responses, recognizing that some of it may be biased or incorrect. Your response should not simply replicate the given answers but should offer a refined, accurate, and comprehensive reply to the instruction. Ensure your response is well-structured, coherent, and adheres to the highest standards of accuracy and reliability.
+def _env_int(name: str, default: int) -> int:
+    raw = os.getenv(name, "").strip()
+    if not raw:
+        return default
+    try:
+        return max(0, int(raw))
+    except ValueError:
+        return default
 
-Responses from models:"""
 
-_debug = DebugSession("moa_tools", env_var="MOA_TOOLS_DEBUG")
+def _env_boolish(name: str, default: str = "auto") -> str:
+    return os.getenv(name, default).strip().lower() or default
+
+
+GEMINI_REFERENCE_MODEL = (
+    os.getenv("HERMES_MOA_GEMINI_REFERENCE_MODEL", "gemini/gemini-3.5-flash").strip()
+    or "gemini/gemini-3.5-flash"
+)
+GEMINI_OAUTH_REFERENCE_MODEL = (
+    os.getenv("HERMES_MOA_GEMINI_OAUTH_REFERENCE_MODEL", "google-gemini-cli/gemini-3.5-flash").strip()
+    or "google-gemini-cli/gemini-3.5-flash"
+)
+
+
+def _gemini_reference_defaults() -> List[str]:
+    """Return a Gemini reference only when it is likely usable.
+
+    The default is "auto": include Google AI Studio when GOOGLE_API_KEY or
+    GEMINI_API_KEY is present, or Gemini CLI OAuth when Hermes is logged in.
+    This avoids adding an unavailable model that would slow every MoA call.
+    """
+    mode = _env_boolish("HERMES_MOA_ENABLE_GEMINI_REFERENCE", "auto")
+    if mode in {"0", "false", "no", "off", "disabled"}:
+        return []
+    if mode in {"1", "true", "yes", "on", "force", "forced"}:
+        return [GEMINI_REFERENCE_MODEL]
+    if os.getenv("GOOGLE_API_KEY") or os.getenv("GEMINI_API_KEY"):
+        return [GEMINI_REFERENCE_MODEL]
+    try:
+        from hermes_cli.auth import get_gemini_oauth_auth_status
+
+        if (get_gemini_oauth_auth_status() or {}).get("logged_in"):
+            return [GEMINI_OAUTH_REFERENCE_MODEL]
+    except Exception:
+        pass
+    return []
+
+
+# Reference models generate independent, tool-less analysis in parallel.
+# `custom/opus` routes to cabinlab Claude Max; `xai-oauth/grok-4.3` routes to
+# Hermes' xAI OAuth provider; `openai-codex/gpt-5.5` routes to Codex.
+# Gemini 3.5 Flash is appended automatically only when credentials exist.
+# OpenRouter slugs still work when passed explicitly.
+REFERENCE_MODELS = _env_list(
+    "HERMES_MOA_REFERENCE_MODELS",
+    [
+        "custom/opus",
+        "openai-codex/gpt-5.5",
+        "xai-oauth/grok-4.3",
+        *_gemini_reference_defaults(),
+    ],
+)
+
+# Aggregator model synthesizes the reference responses. Keep this on GPT-5.5 by
+# default so the aggregation prompt can be rich without affecting Claude's Max
+# subscription prompt-size behavior.
+AGGREGATOR_MODEL = (
+    os.getenv("HERMES_MOA_AGGREGATOR_MODEL", "openai-codex/gpt-5.5").strip()
+    or "openai-codex/gpt-5.5"
+)
+
+# Temperature settings optimized for MoA performance.
+REFERENCE_TEMPERATURE = 0.6
+AGGREGATOR_TEMPERATURE = 0.4
+
+# Failure handling configuration.
+MIN_SUCCESSFUL_REFERENCES = int(os.getenv("HERMES_MOA_MIN_SUCCESSFUL_REFERENCES", "1"))
+
+DEFAULT_REFERENCE_SYSTEM_PROMPT = """You are a reference model inside a Mixture-of-Agents process.
+
+Analyze the user's request independently. Prefer English for internal analysis and dense technical substance, even when the user writes in another language. Preserve all user-specified Japanese wording, names, constraints, commands, paths, and requested output language exactly.
+
+Do not try to be polished. Do not summarize the task back. Focus on:
+- correctness and hidden assumptions
+- edge cases and failure modes
+- concrete implementation or verification risks
+- alternative approaches and tradeoffs
+- concise evidence the aggregator should consider
+
+You do not have tools in this reference call. If tool use would be needed, state precisely what should be checked rather than pretending it was checked."""
+
+REFERENCE_SYSTEM_PROMPT = _env_text(
+    "HERMES_MOA_REFERENCE_SYSTEM_PROMPT",
+    DEFAULT_REFERENCE_SYSTEM_PROMPT,
+)
+
+# Rich/non-compact aggregator prompt. This only goes to the aggregator model
+# inside MoA; it is not the outer Hermes system prompt.
+DEFAULT_AGGREGATOR_SYSTEM_PROMPT = """You are the aggregator in a Mixture-of-Agents process.
+
+You will receive independent reference responses to the latest user request. Synthesize them into the final answer. Optimize for truth, usefulness, and actionability rather than consensus. Explicitly resolve disagreements, discard weak claims, and preserve the strongest mechanisms, caveats, and verification steps.
+
+Rules:
+- Preserve the user's requested language for the final answer unless the user asks otherwise.
+- If the user wrote Japanese, produce natural Japanese in the final answer, while keeping code, commands, paths, identifiers, and quoted strings exact.
+- Do not mention that you are an aggregator unless it is directly useful.
+- Do not include a generic summary section. Give the answer or the next concrete action.
+- Prefer compact but information-dense output.
+- If references lack evidence, say what remains unverified instead of overstating certainty.
+
+Reference responses:"""
+
+AGGREGATOR_SYSTEM_PROMPT = _env_text(
+    "HERMES_MOA_AGGREGATOR_SYSTEM_PROMPT",
+    DEFAULT_AGGREGATOR_SYSTEM_PROMPT,
+)
 
 
 def _construct_aggregator_prompt(system_prompt: str, responses: List[str]) -> str:
-    """
-    Construct the final system prompt for the aggregator including all model responses.
-    
-    Args:
-        system_prompt (str): Base system prompt for aggregation
-        responses (List[str]): List of responses from reference models
-        
-    Returns:
-        str: Complete system prompt with enumerated responses
-    """
-    response_text = "\n".join([f"{i+1}. {response}" for i, response in enumerate(responses)])
+    response_text = "\n\n".join(
+        f"Reference response {i + 1}:\n{response}"
+        for i, response in enumerate(responses)
+    )
     return f"{system_prompt}\n\n{response_text}"
 
+
+def _model_route(model: str) -> tuple[str, str]:
+    """Return (provider, model_slug) for a MoA model spec."""
+    value = (model or "").strip()
+    if value.startswith("custom/"):
+        return "custom", value.split("/", 1)[1] or "opus"
+    if value in {"opus", "sonnet", "haiku"}:
+        return "custom", value
+    if value.startswith("openai-codex/"):
+        return "openai-codex", value.split("/", 1)[1] or "gpt-5.5"
+    if value.startswith("codex/"):
+        return "openai-codex", value.split("/", 1)[1] or "gpt-5.5"
+    if value.startswith("xai-oauth/"):
+        return "xai-oauth", value.split("/", 1)[1] or "grok-4.3"
+    if value.startswith("xai/"):
+        return "xai", value.split("/", 1)[1] or "grok-4.3"
+    if value.startswith("grok/"):
+        return "xai-oauth", value.split("/", 1)[1] or "grok-4.3"
+    if value.startswith("google-gemini-cli/"):
+        return "google-gemini-cli", value.split("/", 1)[1] or "gemini-3.5-flash"
+    if value.startswith("gemini-cli/"):
+        return "google-gemini-cli", value.split("/", 1)[1] or "gemini-3.5-flash"
+    if value.startswith("gemini/"):
+        return "gemini", value.split("/", 1)[1] or "gemini-3.5-flash"
+    if value.startswith("google/"):
+        return "gemini", value.split("/", 1)[1] or "gemini-3.5-flash"
+    return "openrouter", value
+
+
+def _reasoning_extra_body(model: str) -> Optional[Dict[str, Any]]:
+    provider, _ = _model_route(model)
+    if provider != "openrouter":
+        return None
+    return {"reasoning": {"enabled": True, "effort": "xhigh"}}
+
+
+def _moa_client_for_model(model: str):
+    provider, routed_model = _model_route(model)
+    if provider in {"custom", "openai-codex", "xai-oauth", "xai", "gemini", "google-gemini-cli"}:
+        from agent.auxiliary_client import resolve_provider_client
+
+        client, resolved = resolve_provider_client(provider, model=routed_model, async_mode=True)
+        if client is None:
+            raise ValueError(f"Hermes provider {provider!r} is not configured for MoA")
+        return client, resolved or routed_model
+    return _get_openrouter_client(), routed_model
+
+
+MOA_CONTEXT_MAX_CHARS = _env_int("HERMES_MOA_CONTEXT_MAX_CHARS", 8000)
+MOA_CONTEXT_MAX_MESSAGES = _env_int("HERMES_MOA_CONTEXT_MAX_MESSAGES", 24)
+
+
+def _stringify_message_content(content: Any) -> str:
+    if content is None:
+        return ""
+    if isinstance(content, str):
+        return content
+    try:
+        return json.dumps(content, ensure_ascii=False)
+    except Exception:
+        return str(content)
+
+
+def _clip_text(text: str, limit: int) -> str:
+    if limit <= 0 or len(text) <= limit:
+        return text
+    if limit < 32:
+        return text[:limit]
+    head = max(1, limit // 2)
+    tail = max(1, limit - head - 15)
+    return text[:head] + "\n...[truncated]...\n" + text[-tail:]
+
+
+def _recent_session_context(session_id: Optional[str]) -> tuple[str, int, int]:
+    """Load bounded recent user/assistant context for MoA reference calls."""
+    if not session_id or MOA_CONTEXT_MAX_CHARS <= 0 or MOA_CONTEXT_MAX_MESSAGES <= 0:
+        return "", 0, 0
+    db = None
+    try:
+        from hermes_state import SessionDB
+
+        db = SessionDB(read_only=True)
+        rows = db.get_messages(session_id)
+    except Exception as exc:
+        logger.debug("MoA could not load session context for %s: %s", session_id, exc, exc_info=True)
+        return "", 0, 0
+    finally:
+        try:
+            if db is not None:
+                db.close()
+        except Exception:
+            pass
+
+    selected = []
+    for row in reversed(rows):
+        role = row.get("role")
+        if role not in {"user", "assistant"}:
+            continue
+        content = _stringify_message_content(row.get("content")).strip()
+        if not content:
+            continue
+        selected.append((role, content))
+        if len(selected) >= MOA_CONTEXT_MAX_MESSAGES:
+            break
+    selected.reverse()
+
+    parts = []
+    total = 0
+    per_message_limit = max(800, MOA_CONTEXT_MAX_CHARS // max(1, min(MOA_CONTEXT_MAX_MESSAGES, len(selected) or 1)))
+    for role, content in selected:
+        line = f"{role}: {_clip_text(content, per_message_limit)}"
+        remaining = MOA_CONTEXT_MAX_CHARS - total
+        if remaining <= 0:
+            break
+        line = _clip_text(line, remaining)
+        parts.append(line)
+        total += len(line) + 2
+    context = "\n\n".join(parts).strip()
+    return context, len(parts), len(context)
+
+
+def _augment_user_prompt_with_context(user_prompt: str, session_id: Optional[str]) -> tuple[str, int, int]:
+    context, message_count, char_count = _recent_session_context(session_id)
+    if not context:
+        return user_prompt, 0, 0
+    return (
+        "Recent Hermes conversation context (oldest to newest; tool outputs omitted; "
+        "use this only as supporting context, and prioritize the latest request):\n\n"
+        f"{context}\n\n"
+        "Latest user request / MoA problem:\n\n"
+        f"{user_prompt}"
+    ), message_count, char_count
+
+
+
+_debug = DebugSession("moa_tools", env_var="MOA_TOOLS_DEBUG")
 
 async def _run_reference_model_safe(
     model: str,
@@ -126,25 +357,26 @@ async def _run_reference_model_safe(
         try:
             logger.info("Querying %s (attempt %s/%s)", model, attempt + 1, max_retries)
             
-            # Build parameters for the API call
+            client, routed_model = _moa_client_for_model(model)
             api_params = {
-                "model": model,
-                "messages": [{"role": "user", "content": user_prompt}],
+                "model": routed_model,
+                "messages": [
+                    {"role": "system", "content": REFERENCE_SYSTEM_PROMPT},
+                    {"role": "user", "content": user_prompt},
+                ],
                 "max_tokens": max_tokens,
-                "extra_body": {
-                    "reasoning": {
-                        "enabled": True,
-                        "effort": "xhigh"
-                    }
-                }
             }
+            extra_body = _reasoning_extra_body(model)
+            if extra_body:
+                api_params["extra_body"] = extra_body
             
-            # GPT models (especially gpt-4o-mini) don't support custom temperature values
-            # Only include temperature for non-GPT models
-            if not model.lower().startswith('gpt-'):
+            # GPT models do not reliably support custom temperature values.
+            # Check the routed model because provider/model specs may be
+            # prefixed (for example, openai-codex/gpt-5.5).
+            if not routed_model.lower().startswith('gpt-'):
                 api_params["temperature"] = temperature
             
-            response = await _get_openrouter_client().chat.completions.create(**api_params)
+            response = await client.chat.completions.create(**api_params)
             
             content = extract_content_or_reasoning(response)
             if not content:
@@ -181,6 +413,7 @@ async def _run_reference_model_safe(
 async def _run_aggregator_model(
     system_prompt: str,
     user_prompt: str,
+    model: str = AGGREGATOR_MODEL,
     temperature: float = AGGREGATOR_TEMPERATURE,
     max_tokens: int = None
 ) -> str:
@@ -196,37 +429,33 @@ async def _run_aggregator_model(
     Returns:
         str: Synthesized final response
     """
-    logger.info("Running aggregator model: %s", AGGREGATOR_MODEL)
+    logger.info("Running aggregator model: %s", model)
+    client, routed_model = _moa_client_for_model(model)
 
-    # Build parameters for the API call
     api_params = {
-        "model": AGGREGATOR_MODEL,
+        "model": routed_model,
         "messages": [
             {"role": "system", "content": system_prompt},
             {"role": "user", "content": user_prompt}
         ],
-        "max_tokens": max_tokens,
-        "extra_body": {
-            "reasoning": {
-                "enabled": True,
-                "effort": "xhigh"
-            }
-        }
     }
+    if max_tokens is not None:
+        api_params["max_tokens"] = max_tokens
+    extra_body = _reasoning_extra_body(model)
+    if extra_body:
+        api_params["extra_body"] = extra_body
 
-    # GPT models (especially gpt-4o-mini) don't support custom temperature values
-    # Only include temperature for non-GPT models
-    if not AGGREGATOR_MODEL.lower().startswith('gpt-'):
+    if not routed_model.lower().startswith('gpt-'):
         api_params["temperature"] = temperature
 
-    response = await _get_openrouter_client().chat.completions.create(**api_params)
+    response = await client.chat.completions.create(**api_params)
 
     content = extract_content_or_reasoning(response)
 
     # Retry once on empty content (reasoning-only response)
     if not content:
         logger.warning("Aggregator returned empty content, retrying once")
-        response = await _get_openrouter_client().chat.completions.create(**api_params)
+        response = await client.chat.completions.create(**api_params)
         content = extract_content_or_reasoning(response)
 
     logger.info("Aggregation complete (%s characters)", len(content))
@@ -236,7 +465,8 @@ async def _run_aggregator_model(
 async def mixture_of_agents_tool(
     user_prompt: str,
     reference_models: Optional[List[str]] = None,
-    aggregator_model: Optional[str] = None
+    aggregator_model: Optional[str] = None,
+    session_id: Optional[str] = None
 ) -> str:
     """
     Process a complex query using the Mixture-of-Agents methodology.
@@ -275,6 +505,10 @@ async def mixture_of_agents_tool(
         Exception: If MoA processing fails or API key is not set
     """
     start_time = datetime.datetime.now()
+    moa_user_prompt, context_message_count, context_chars = _augment_user_prompt_with_context(
+        user_prompt,
+        session_id,
+    )
     
     debug_call_data = {
         "parameters": {
@@ -283,7 +517,9 @@ async def mixture_of_agents_tool(
             "aggregator_model": aggregator_model or AGGREGATOR_MODEL,
             "reference_temperature": REFERENCE_TEMPERATURE,
             "aggregator_temperature": AGGREGATOR_TEMPERATURE,
-            "min_successful_references": MIN_SUCCESSFUL_REFERENCES
+            "min_successful_references": MIN_SUCCESSFUL_REFERENCES,
+            "context_message_count": context_message_count,
+            "context_chars": context_chars,
         },
         "error": None,
         "success": False,
@@ -299,10 +535,6 @@ async def mixture_of_agents_tool(
         logger.info("Starting Mixture-of-Agents processing...")
         logger.info("Query: %s", user_prompt[:100])
         
-        # Validate API key availability
-        if not os.getenv("OPENROUTER_API_KEY"):
-            raise ValueError("OPENROUTER_API_KEY environment variable not set")
-        
         # Use provided models or defaults
         ref_models = reference_models or REFERENCE_MODELS
         agg_model = aggregator_model or AGGREGATOR_MODEL
@@ -312,7 +544,7 @@ async def mixture_of_agents_tool(
         # Layer 1: Generate diverse responses from reference models (with failure handling)
         logger.info("Layer 1: Generating reference responses...")
         model_results = await asyncio.gather(*[
-            _run_reference_model_safe(model, user_prompt, REFERENCE_TEMPERATURE)
+            _run_reference_model_safe(model, moa_user_prompt, REFERENCE_TEMPERATURE)
             for model in ref_models
         ])
         
@@ -351,7 +583,8 @@ async def mixture_of_agents_tool(
         
         final_response = await _run_aggregator_model(
             aggregator_system_prompt,
-            user_prompt,
+            moa_user_prompt,
+            agg_model,
             AGGREGATOR_TEMPERATURE
         )
         
@@ -410,13 +643,16 @@ async def mixture_of_agents_tool(
 
 
 def check_moa_requirements() -> bool:
-    """
-    Check if all requirements for MoA tools are met.
-    
-    Returns:
-        bool: True if requirements are met, False otherwise
-    """
-    return check_openrouter_api_key()
+    """Return True when at least one configured MoA route is available."""
+    if check_openrouter_api_key():
+        return True
+    for spec in [*REFERENCE_MODELS, AGGREGATOR_MODEL]:
+        try:
+            _moa_client_for_model(spec)
+            return True
+        except Exception:
+            continue
+    return False
 
 
 
@@ -517,13 +753,22 @@ from tools.registry import registry
 
 MOA_SCHEMA = {
     "name": "mixture_of_agents",
-    "description": "Route a hard problem through multiple frontier LLMs collaboratively. Makes 5 API calls (4 reference models + 1 aggregator) with maximum reasoning effort — use sparingly for genuinely difficult problems. Best for: complex math, advanced algorithms, multi-step analytical reasoning, problems benefiting from diverse perspectives.",
+    "description": "Route a hard problem through multiple frontier LLMs collaboratively. Runs multiple reference models plus one aggregator; use sparingly for genuinely difficult problems. Best for: complex math, advanced algorithms, multi-step analytical reasoning, problems benefiting from diverse perspectives.",
     "parameters": {
         "type": "object",
         "properties": {
             "user_prompt": {
                 "type": "string",
-                "description": "The complex query or problem to solve using multiple AI models. Should be a challenging problem that benefits from diverse perspectives and collaborative reasoning."
+                "description": "The complex query or problem to solve using multiple AI models. Recent Hermes session context is automatically prepended when available, so include only task-specific details here."
+            },
+            "reference_models": {
+                "type": "array",
+                "items": {"type": "string"},
+                "description": "Optional reference model list. Defaults to custom/opus, openai-codex/gpt-5.5, xai-oauth/grok-4.3, and Gemini 3.5 Flash when Gemini credentials are available. Use custom/opus for cabinlab Claude Max, xai-oauth/grok-4.3 for Grok OAuth, openai-codex/gpt-5.5 for Codex, gemini/gemini-3.5-flash for Google AI Studio, google-gemini-cli/gemini-3.5-flash for Gemini CLI OAuth, or vendor/model slugs for OpenRouter."
+            },
+            "aggregator_model": {
+                "type": "string",
+                "description": "Optional aggregator model. Defaults to openai-codex/gpt-5.5 with a rich non-compact aggregation prompt."
             }
         },
         "required": ["user_prompt"]
@@ -534,9 +779,14 @@ registry.register(
     name="mixture_of_agents",
     toolset="moa",
     schema=MOA_SCHEMA,
-    handler=lambda args, **kw: mixture_of_agents_tool(user_prompt=args.get("user_prompt", "")),
+    handler=lambda args, **kw: mixture_of_agents_tool(
+        user_prompt=args.get("user_prompt", ""),
+        reference_models=args.get("reference_models"),
+        aggregator_model=args.get("aggregator_model"),
+        session_id=kw.get("session_id"),
+    ),
     check_fn=check_moa_requirements,
-    requires_env=["OPENROUTER_API_KEY"],
+    requires_env=[],
     is_async=True,
     emoji="🧠",
 )

@@ -162,9 +162,15 @@ TOOLSETS = {
         "includes": []
     },
     
+    "skill_search": {
+        "description": "Search and view skill documents without exposing skill editing or injecting the full skills index",
+        "tools": ["skills_list", "skill_view"],
+        "includes": []
+    },
+
     "skills": {
-        "description": "Access, create, edit, and manage skill documents with specialized instructions and knowledge",
-        "tools": ["skills_list", "skill_view", "skill_manage"],
+        "description": "Create, edit, and manage skill documents. Pair with skill_search to list and view skills.",
+        "tools": ["skill_manage"],
         "includes": []
     },
     

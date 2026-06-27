@@ -1595,7 +1595,7 @@ SKILL_VIEW_SCHEMA = {
 
 registry.register(
     name="skills_list",
-    toolset="skills",
+    toolset="skill_search",
     schema=SKILLS_LIST_SCHEMA,
     handler=lambda args, **kw: skills_list(
         category=args.get("category"), task_id=kw.get("task_id")
@@ -1630,7 +1630,7 @@ def _skill_view_with_bump(args, **kw):
 
 registry.register(
     name="skill_view",
-    toolset="skills",
+    toolset="skill_search",
     schema=SKILL_VIEW_SCHEMA,
     handler=_skill_view_with_bump,
     check_fn=check_skills_requirements,

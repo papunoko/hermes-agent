@@ -195,7 +195,19 @@ def build_system_prompt_parts(agent: Any, system_message: Optional[str] = None) 
                 stable_parts.append(OPENAI_MODEL_EXECUTION_GUIDANCE)
 
     has_skills_tools = any(name in agent.valid_tool_names for name in ['skills_list', 'skill_view', 'skill_manage'])
-    if has_skills_tools:
+
+    def _skills_index_enabled() -> bool:
+        try:
+            from hermes_cli.config import load_config, cfg_get
+
+            raw = cfg_get(load_config() or {}, "agent", "skills_prompt", default=True)
+        except Exception:
+            raw = True
+        if isinstance(raw, str):
+            return raw.strip().lower() not in {"0", "false", "no", "off", "disabled"}
+        return bool(raw)
+
+    if has_skills_tools and _skills_index_enabled():
         avail_toolsets = {
             toolset
             for toolset in (
